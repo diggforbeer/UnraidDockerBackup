@@ -1,0 +1,158 @@
+#!/bin/bash
+# consld8 - Consolidate an unRAID user share directory onto a single disk.
+#
+# usage: consld8 [options:-h|-t|-f|-v|-q] /path/to/user/share/directory [disk#]
+#   
+
+usage(){
+cat << EOF
+
+usage: consld8 [options:-h|-t|-f|-v|-q] directory [disk#]
+
+directory    Any directory that is contained in the user share file system.
+             It can be specified as an absolute or relative path and can be 
+             relative to the current directory or the /mnt/user/ directory.  
+
+disk#        Any valid disk in the unraid array. Optional: if no disk is 
+             specified, consld8 will determine the destination disk based on
+             max usage and available free space.
+
+options:
+  -h    Display this usage information.
+  -t    Perform a test run. No files will be moved.
+  -f    Override test mode and force valid moves to be performed.
+  -v    Print more information.
+  -q    Print less information.
+
+EOF
+}
+
+[ ${DEBUG:=0} -gt 0 ] && set -x -v
+
+# Set shell options
+shopt -s nullglob  #remove words with no matching filenames
+
+# Process options
+verbose=1
+doit='false' # Default to test mode where no files are moved
+
+while :; do
+  case "$1" in
+    -h|-\?|--help)
+      usage
+      exit 0
+      ;;
+    -t|--test) # Specify test mode where no files are moved
+      doit='false'
+      ;;
+    -f|--force) # Override test mode and force action
+      doit='true'
+      ;;
+    -v|--verbose)
+      verbose=$((verbose + 1)) # Each -v argument adds 1 to verbosity
+      ;;
+    -q|--quiet)
+      verbose=$((verbose - 1)) # Each -q argument subtracts 1 from verbosity
+      ;;
+    --) # End of all options
+      break
+      ;;
+    -?*)
+      echo "Unknown option (ignored): $1" >&2
+      ;;
+    *) # Default case: if no more options then break out of loop
+      break
+  esac
+  shift
+done
+
+# Process input parameters
+if [ -d "$1" ]
+then
+  FULLNAME=$(readlink -e "$1")   # Handle relative path
+  SRCDIR="${FULLNAME#/mnt/*/}"   # Remove any /mnt/*/ prefix
+else
+  SRCDIR="$1"
+fi
+
+if [ ! -d "/mnt/user/$SRCDIR" ]
+then 
+  echo "'$1' is not a valid user share." >&2
+  usage >&2
+  exit 1
+fi
+
+if [ -z "$2" ]
+then
+  DESTDISK='auto'
+else
+  DESTDISK="${2#/mnt/}"    #Remove any leading /mnt/ prefix
+  DESTDISK="${DESTDISK%%/*}"    #Remove any trailing path
+  if [[ ! -d "/mnt/$DESTDISK" || "$DESTDISK" != disk[1-9] && "$DESTDISK" != disk[1-9][0-9] ]]
+  then
+    echo "'$2' is not a valid destination disk." >&2
+    usage >&2
+    exit 2
+  fi
+fi
+
+SHSIZE=$(du -s "/mnt/user/$SRCDIR" | cut -f 1)
+[ $verbose -gt 0 ] && echo "/mnt/user/$SRCDIR  Total usage: $SHSIZE"
+
+# If disk# not specified, determine the destination disk
+if [ "$DESTDISK" == 'auto' ]; then
+  [ $verbose -gt 0 ] && echo "$0 will determine destination disk"
+  MAXUSAGE=-1
+  for d in /mnt/disk[1-9]{,[0-9]}
+    do
+    if [ -d "$d/$SRCDIR" ]; then
+      DUSAGE=$(du -s "$d/$SRCDIR" | cut -f 1)
+    else
+      DUSAGE=0
+    fi #source directory is on current disk
+    DFREE=$(df "$d" | grep "$d" | awk '{ print $4 }' )  #Disk free space
+    [ $verbose -gt 0 ] && echo "$d/$SRCDIR used: $DUSAGE free: $DFREE"
+    ODUSAGE=$(($SHSIZE-$DUSAGE))  #Other Disk Usage
+    if [ "$DUSAGE" -gt "$MAXUSAGE" -a "$DFREE" -gt "$ODUSAGE" ]; then
+      MAXUSAGE="$DUSAGE"
+      DESTDISK="${d#/mnt/}"  #Remove any leading /mnt/ prefix
+      [ $verbose -gt 1 ] && echo "$DESTDISK is max so far"
+    fi 
+  done
+  if [ "$DESTDISK" == 'auto' ]; then
+    echo "No disk found with enough space" >&2
+    exit 3
+  fi
+else #destination is disk specified
+  [ $verbose -gt 0 ] && echo "Destination disk has been specified: $DESTDISK"
+  if [ -d "/mnt/$DESTDISK/$SRCDIR" ]; then
+    DUSAGE=$(du -s "/mnt/$DESTDISK/$SRCDIR" | cut -f 1)
+  else
+    DUSAGE=0
+  fi #source directory is on specified disk
+  DFREE=$(df "/mnt/$DESTDISK" | grep "$DESTDISK" | awk '{ print $4 }' )  #Disk free space
+  [ $verbose -gt 0 ] && echo "/mnt/$DESTDISK/$SRCDIR" used: $DUSAGE free: $DFREE
+  ODUSAGE=$(($SHSIZE-$DUSAGE))  #Other Disk Usage
+  if [ "$DFREE" -lt "$ODUSAGE" ]; then
+    echo "Not enough free space on $DESTDISK" >&2
+    exit 4
+  fi
+fi 
+
+# Loop through disks and merge source directory onto destination disk
+for d in /mnt/{disk[1-9]{,[0-9]},cach[e]}
+#                                    ^ ^
+#  the backets are to force pattern matching and with shopt -s nullglob
+#  will not produce an error if cache does not exist. 
+do
+  [ $verbose -gt 1 ] && echo "Checking $d ..."
+  if [ -d "$d/$SRCDIR" -a "/mnt/$DESTDISK" != "$d" ]; then
+    [ $verbose -gt 0 ] && echo "Merge $d/$SRCDIR onto $DESTDISK"
+    if [ $doit == 'true' ]; then
+      bash diskmv -f "$SRCDIR" "$d" "$DESTDISK"
+    else
+      echo "Running in test mode, no files moved."
+    fi
+  fi
+done
+ 
